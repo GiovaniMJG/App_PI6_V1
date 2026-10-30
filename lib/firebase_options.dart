@@ -21,10 +21,7 @@ class DefaultFirebaseOptions {
     }
     switch (defaultTargetPlatform) {
       case TargetPlatform.android:
-        throw UnsupportedError(
-          'DefaultFirebaseOptions have not been configured for android - '
-          'you can reconfigure this by running the FlutterFire CLI again.',
-        );
+        return android;
       case TargetPlatform.iOS:
         throw UnsupportedError(
           'DefaultFirebaseOptions have not been configured for ios - '
@@ -60,5 +57,13 @@ class DefaultFirebaseOptions {
     authDomain: 'estufa-app-pi-6.firebaseapp.com',
     storageBucket: 'estufa-app-pi-6.firebasestorage.app',
     measurementId: 'G-2FWC8E2RNS',
+  );
+
+  static const FirebaseOptions android = FirebaseOptions(
+    apiKey: 'AIzaSyDHNGTw8fZZiSooERHLkBAMKvZse_0cs_Y',
+    appId: '1:1052978503080:android:53fe02c79733c55bab519d',
+    messagingSenderId: '1052978503080',
+    projectId: 'estufa-app-pi-6',
+    storageBucket: 'estufa-app-pi-6.firebasestorage.app',
   );
 }

@@ -1,25 +1,50 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
 import 'firebase_options.dart';
 
-// Opções do seletor de intervalo do histórico (por enquanto só na interface).
-enum IntervaloHistorico {
-  meiaHora('30 min'),
-  umaHora('1 hora'),
-  duasHoras('2 horas'),
-  quatroHoras('4 horas');
+// Períodos do histórico.
+enum PeriodoHistorico {
+  meiaHora('30 min', Duration(minutes: 30), 10),
+  umaHora('1 h', Duration(hours: 1), 15),
+  duasHoras('2 h', Duration(hours: 2), 30),
+  quatroHoras('4 h', Duration(hours: 4), 60);
 
   final String label;
-  const IntervaloHistorico(this.label);
+  final Duration duracao;
+  final int minutosEntreMarcacoes; // espaçamento dos rótulos do eixo X
+  const PeriodoHistorico(this.label, this.duracao, this.minutosEntreMarcacoes);
 }
+
+// Pontos por gráfico; as leituras são agrupadas por faixa de tempo.
+const int pontosPorGrafico = 30;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  await _configurarNotificacoes();
   runApp(const MyApp());
+}
+
+// Push (FCM): inscrição no tópico "alertas", enviado pelo simulador.
+// Tópicos não existem na web.
+Future<void> _configurarNotificacoes() async {
+  if (kIsWeb) return;
+  try {
+    final fcm = FirebaseMessaging.instance;
+    await fcm.requestPermission();
+    await fcm.subscribeToTopic('alertas');
+  } catch (erro) {
+    // Falha (ex.: sem internet) não impede o app de abrir.
+    debugPrint('Não foi possível ativar as notificações: $erro');
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -41,29 +66,33 @@ class MyApp extends StatelessWidget {
 const Color corPerigo = Colors.red;
 const Color corSegura = Colors.blue;
 
-// Limites para aletas. Mudar os valores conforme o ideal pela empresa.
-const double temperaturaMin = 15.0;
-const double temperaturaMax = 30.0;
-const double umidadeMin = 40.0;
-const double umidadeMax = 70.0;
+// Limites da ficha de controle da empresa (FOR 6.3.3). Só há máximo.
+const double temperaturaMax = 20.0;
+const double umidadeMax = 60.0;
 
-const double temperaturaGraficoMin = -30.0;
-const double temperaturaGraficoMax = 80.0;
+const double temperaturaGraficoMin = 0.0;
+const double temperaturaGraficoMax = 40.0;
 const double umidadeGraficoMin = 0.0;
 const double umidadeGraficoMax = 100.0;
+
+// Formatação de horário (09:05 e 09:05:30).
+String _doisDigitos(int n) => n.toString().padLeft(2, '0');
+String _horaMinuto(DateTime t) =>
+    '${_doisDigitos(t.hour)}:${_doisDigitos(t.minute)}';
+String _horaCompleta(DateTime t) =>
+    '${_horaMinuto(t)}:${_doisDigitos(t.second)}';
 
 class EstufaHomePage extends StatelessWidget {
   const EstufaHomePage({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final leituraRef =
-        FirebaseFirestore.instance.collection('estufa').doc('leitura_atual');
+    final leituraRef = FirebaseFirestore.instance
+        .collection('estufa')
+        .doc('leitura_atual');
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Monitoramento da Estufa'),
-      ),
+      appBar: AppBar(title: const Text('Monitoramento da Estufa')),
       body: StreamBuilder<DocumentSnapshot>(
         stream: leituraRef.snapshots(),
         builder: (context, snapshot) {
@@ -78,15 +107,15 @@ class EstufaHomePage extends StatelessWidget {
           final double temperatura = dados['temperatura'] as double;
           final double umidade = dados['umidade'] as double;
 
-          final bool temperaturaPerigo =
-              temperatura < temperaturaMin || temperatura > temperaturaMax;
-          final bool umidadePerigo =
-              umidade < umidadeMin || umidade > umidadeMax;
+          final bool temperaturaPerigo = temperatura > temperaturaMax;
+          final bool umidadePerigo = umidade > umidadeMax;
 
           final bool emPerigo = temperaturaPerigo || umidadePerigo;
 
           return SingleChildScrollView(
             child: Column(
+              // Largura total, mantém o conteúdo centralizado.
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 if (emPerigo)
                   _AlertaPerigo(
@@ -106,23 +135,7 @@ class EstufaHomePage extends StatelessWidget {
                   perigo: umidadePerigo,
                 ),
                 const SizedBox(height: 32),
-                const _GraficoHistorico(
-                  campo: 'temperatura',
-                  titulo: 'Histórico de Temperatura',
-                  min: temperaturaMin,
-                  max: temperaturaMax,
-                  eixoMin: temperaturaGraficoMin,
-                  eixoMax: temperaturaGraficoMax,
-                ),
-                const SizedBox(height: 32),
-                const _GraficoHistorico(
-                  campo: 'umidade',
-                  titulo: 'Histórico de Umidade',
-                  min: umidadeMin,
-                  max: umidadeMax,
-                  eixoMin: umidadeGraficoMin,
-                  eixoMax: umidadeGraficoMax,
-                ),
+                const _PainelHistorico(),
                 const SizedBox(height: 24),
               ],
             ),
@@ -133,177 +146,370 @@ class EstufaHomePage extends StatelessWidget {
   }
 }
 
-class _GraficoHistorico extends StatefulWidget {
-  const _GraficoHistorico({
-    required this.campo,
-    required this.titulo,
-    required this.min,
-    required this.max,
-    required this.eixoMin,
-    required this.eixoMax,
-  });
+// Leitura do histórico.
+class _Leitura {
+  const _Leitura(this.horario, this.temperatura, this.umidade);
 
-  final String campo;
-  final String titulo;
-  final double min;
-  final double max;
-  final double eixoMin;
-  final double eixoMax;
-
-  @override
-  State<_GraficoHistorico> createState() => _GraficoHistoricoState();
+  final DateTime horario;
+  final double temperatura;
+  final double umidade;
 }
 
-class _GraficoHistoricoState extends State<_GraficoHistorico> {
-  IntervaloHistorico _intervalo = IntervaloHistorico.umaHora;
+// Ponto do gráfico: média das leituras de uma faixa de tempo.
+class _Ponto {
+  const _Ponto({
+    required this.horario,
+    required this.media,
+    required this.maximo,
+    required this.quantidade,
+  });
+
+  final DateTime horario; // horário médio das leituras da faixa
+  final double media;
+  final double maximo;
+  final int quantidade;
+}
+
+// Seletor de período e gráficos; uma única consulta alimenta os dois.
+class _PainelHistorico extends StatefulWidget {
+  const _PainelHistorico();
 
   @override
-  Widget build(BuildContext context) {
-    final String campo = widget.campo;
-    final String titulo = widget.titulo;
-    final double min = widget.min;
-    final double max = widget.max;
-    final double eixoMin = widget.eixoMin;
-    final double eixoMax = widget.eixoMax;
+  State<_PainelHistorico> createState() => _PainelHistoricoState();
+}
 
-    final historicoRef = FirebaseFirestore.instance
+class _PainelHistoricoState extends State<_PainelHistorico> {
+  PeriodoHistorico _periodo = PeriodoHistorico.umaHora;
+  late DateTime _inicioConsulta;
+  late Stream<QuerySnapshot> _consulta;
+  late final Timer _relogio;
+
+  @override
+  void initState() {
+    super.initState();
+    _montarConsulta();
+    // Atualiza a janela de tempo a cada 30 s, mesmo sem leituras novas.
+    _relogio = Timer.periodic(const Duration(seconds: 30), (_) {
+      setState(() {
+        // Renova a consulta quando ela acumula leituras antigas demais.
+        if (DateTime.now().difference(_inicioConsulta) > _periodo.duracao * 2) {
+          _montarConsulta();
+        }
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _relogio.cancel();
+    super.dispose();
+  }
+
+  // Consulta mantida no estado: recriá-la no build releria todo o período
+  // a cada nova leitura, consumindo a cota do Firestore.
+  void _montarConsulta() {
+    _inicioConsulta = DateTime.now().subtract(_periodo.duracao);
+    _consulta = FirebaseFirestore.instance
         .collection('estufa')
         .doc('leitura_atual')
         .collection('historico')
-        .orderBy('timestamp', descending: true)
-        .limit(10);
+        .where(
+          'timestamp',
+          isGreaterThanOrEqualTo: Timestamp.fromDate(_inicioConsulta),
+        )
+        .orderBy('timestamp')
+        .snapshots();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        const Text('Histórico', style: TextStyle(fontSize: 20)),
+        const SizedBox(height: 8),
+        SegmentedButton<PeriodoHistorico>(
+          showSelectedIcon: false,
+          segments: [
+            for (final periodo in PeriodoHistorico.values)
+              ButtonSegment(value: periodo, label: Text(periodo.label)),
+          ],
+          selected: {_periodo},
+          onSelectionChanged: (selecionados) {
+            setState(() {
+              _periodo = selecionados.first;
+              _montarConsulta();
+            });
+          },
+        ),
+        const SizedBox(height: 16),
+        StreamBuilder<QuerySnapshot>(
+          stream: _consulta,
+          builder: (context, snapshot) {
+            if (snapshot.hasError) {
+              return Text('Erro ao carregar o histórico: ${snapshot.error}');
+            }
+            if (!snapshot.hasData) {
+              return const Padding(
+                padding: EdgeInsets.all(32),
+                child: CircularProgressIndicator(),
+              );
+            }
+
+            // Janela exibida: do horário atual para trás.
+            final DateTime inicio = DateTime.now().subtract(_periodo.duracao);
+            final leituras = [
+              for (final doc in snapshot.data!.docs)
+                if (doc.data() case final Map<String, dynamic> dados)
+                  _Leitura(
+                    (dados['timestamp'] as Timestamp).toDate(),
+                    (dados['temperatura'] as num).toDouble(),
+                    (dados['umidade'] as num).toDouble(),
+                  ),
+            ].where((l) => !l.horario.isBefore(inicio)).toList();
+
+            if (leituras.isEmpty) {
+              return const Padding(
+                padding: EdgeInsets.all(32),
+                child: Text(
+                  'Nenhuma leitura neste período.\n'
+                  'Ligue o simulador para gerar dados.',
+                  textAlign: TextAlign.center,
+                ),
+              );
+            }
+
+            return Column(
+              children: [
+                _GraficoHistorico(
+                  titulo: 'Temperatura',
+                  unidade: '°C',
+                  limite: temperaturaMax,
+                  eixoMin: temperaturaGraficoMin,
+                  eixoMax: temperaturaGraficoMax,
+                  inicio: inicio,
+                  periodo: _periodo,
+                  pontos: _agrupar(leituras, inicio, (l) => l.temperatura),
+                ),
+                const SizedBox(height: 24),
+                _GraficoHistorico(
+                  titulo: 'Umidade',
+                  unidade: '%',
+                  limite: umidadeMax,
+                  eixoMin: umidadeGraficoMin,
+                  eixoMax: umidadeGraficoMax,
+                  inicio: inicio,
+                  periodo: _periodo,
+                  pontos: _agrupar(leituras, inicio, (l) => l.umidade),
+                ),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  // Agrupa as leituras em faixas de tempo iguais (média e máximo).
+  List<_Ponto> _agrupar(
+    List<_Leitura> leituras,
+    DateTime inicio,
+    double Function(_Leitura) valorDe,
+  ) {
+    final double segundosPorFaixa =
+        _periodo.duracao.inSeconds / pontosPorGrafico;
+    final faixas = <int, List<_Leitura>>{};
+    for (final l in leituras) {
+      final int indice =
+          (l.horario.difference(inicio).inSeconds / segundosPorFaixa)
+              .floor()
+              .clamp(0, pontosPorGrafico - 1);
+      faixas.putIfAbsent(indice, () => []).add(l);
+    }
+
+    final indices = faixas.keys.toList()..sort();
+    return [
+      for (final i in indices)
+        _Ponto(
+          horario: DateTime.fromMillisecondsSinceEpoch(
+            faixas[i]!
+                    .map((l) => l.horario.millisecondsSinceEpoch)
+                    .reduce((a, b) => a + b) ~/
+                faixas[i]!.length,
+          ),
+          media:
+              faixas[i]!.map(valorDe).reduce((a, b) => a + b) /
+              faixas[i]!.length,
+          maximo: faixas[i]!.map(valorDe).reduce(math.max),
+          quantidade: faixas[i]!.length,
+        ),
+    ];
+  }
+}
+
+class _GraficoHistorico extends StatelessWidget {
+  const _GraficoHistorico({
+    required this.titulo,
+    required this.unidade,
+    required this.limite,
+    required this.eixoMin,
+    required this.eixoMax,
+    required this.inicio,
+    required this.periodo,
+    required this.pontos,
+  });
+
+  final String titulo;
+  final String unidade;
+  final double limite;
+  final double eixoMin;
+  final double eixoMax;
+  final DateTime inicio;
+  final PeriodoHistorico periodo;
+  final List<_Ponto> pontos;
+
+  // Usa o máximo da faixa, para um desvio curto não sumir na média.
+  Color _corDoPonto(_Ponto ponto) =>
+      ponto.maximo > limite ? corPerigo : corSegura;
+
+  @override
+  Widget build(BuildContext context) {
+    final double maiorValor = pontos.map((p) => p.media).reduce(math.max);
+    final double menorValor = pontos.map((p) => p.media).reduce(math.min);
+    // Escala ampliada se necessário, em múltiplos de 10.
+    final double eixoMaxReal =
+        (math.max(eixoMax, maiorValor) / 10).ceil() * 10.0;
+    final double eixoMinReal =
+        (math.min(eixoMin, menorValor) / 10).floor() * 10.0;
+
+    // Eixo X em minutos desde a meia-noite: rótulos em horários redondos.
+    final DateTime meiaNoite = DateTime(inicio.year, inicio.month, inicio.day);
+    double posicaoX(DateTime t) => t.difference(meiaNoite).inSeconds / 60;
+    final double minX = posicaoX(inicio);
+    final double maxX = posicaoX(inicio.add(periodo.duracao));
+    final int intervalo = periodo.minutosEntreMarcacoes;
 
     return Column(
       children: [
-        Text(titulo, style: const TextStyle(fontSize: 20)),
-        const SizedBox(height: 8),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Text('Intervalo entre medições: '),
-            DropdownButton<IntervaloHistorico>(
-              value: _intervalo,
-              items: [
-                for (final opcao in IntervaloHistorico.values)
-                  DropdownMenuItem(value: opcao, child: Text(opcao.label)),
-              ],
-              onChanged: (novoIntervalo) {
-                if (novoIntervalo != null) {
-                  setState(() => _intervalo = novoIntervalo);
-                }
-              },
-            ),
-          ],
-        ),
+        Text(titulo, style: const TextStyle(fontSize: 18)),
         const SizedBox(height: 8),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: SizedBox(
             height: 200,
-            child: StreamBuilder<QuerySnapshot>(
-              stream: historicoRef.snapshots(),
-              builder: (context, snapshot) {
-                if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-
-                
-                final List<double> valores = snapshot.data!.docs
-                    .map((doc) => (doc.data() as Map<String, dynamic>)[campo] as double)
-                    .toList()
-                    .reversed
-                    .toList();
-
-
-                final double eixoMinReal = eixoMin < min ? eixoMin : min;
-                final double eixoMaxReal = eixoMax > max ? eixoMax : max;
-
-                Color corDoValor(double valor) =>
-                    (valor < min || valor > max) ? corPerigo : corSegura;
-
-                return LineChart(
-                  LineChartData(
-                    minY: eixoMinReal,
-                    maxY: eixoMaxReal,
-                    gridData: const FlGridData(show: false),
-                    titlesData: FlTitlesData(
-                      topTitles: const AxisTitles(),
-                      rightTitles: const AxisTitles(),
-                      bottomTitles: AxisTitles(
-                        sideTitles: SideTitles(
-                          showTitles: true,
-                          interval: 1,
-                          getTitlesWidget: (value, meta) =>
-                              Text(value.toInt().toString()),
-                        ),
-                      ),
+            child: LineChart(
+              LineChartData(
+                clipData: const FlClipData.all(),
+                minX: minX,
+                maxX: maxX,
+                minY: eixoMinReal,
+                maxY: eixoMaxReal,
+                gridData: const FlGridData(show: false),
+                titlesData: FlTitlesData(
+                  topTitles: const AxisTitles(),
+                  rightTitles: const AxisTitles(),
+                  bottomTitles: AxisTitles(
+                    axisNameWidget: const Text('Horário da medição'),
+                    sideTitles: SideTitles(
+                      showTitles: true,
+                      reservedSize: 28,
+                      interval: intervalo.toDouble(),
+                      getTitlesWidget: (value, meta) {
+                        // Oculta os rótulos das bordas (horários quebrados).
+                        final int minuto = value.round();
+                        if ((value - minuto).abs() > 0.01 ||
+                            minuto % intervalo != 0) {
+                          return const SizedBox.shrink();
+                        }
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            _horaMinuto(
+                              meiaNoite.add(Duration(minutes: minuto)),
+                            ),
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                        );
+                      },
                     ),
-                    extraLinesData: ExtraLinesData(
-                      horizontalLines: [
-                        HorizontalLine(
-                          y: min,
-                          color: Colors.grey,
-                          strokeWidth: 1,
-                          dashArray: [6, 4],
-                        ),
-                        HorizontalLine(
-                          y: max,
-                          color: Colors.grey,
-                          strokeWidth: 1,
-                          dashArray: [6, 4],
-                        ),
-                      ],
+                  ),
+                ),
+                extraLinesData: ExtraLinesData(
+                  horizontalLines: [
+                    HorizontalLine(
+                      y: limite,
+                      color: Colors.grey,
+                      strokeWidth: 1,
+                      dashArray: [6, 4],
                     ),
-                    lineBarsData: [
-                      LineChartBarData(
-                        spots: [
-                          for (int i = 0; i < valores.length; i++)
-                            FlSpot(i.toDouble(), valores[i]),
-                        ],
-                        isCurved: true,
-                        color: Colors.black,
-                        dotData: FlDotData(
-                          show: true,
-                          getDotPainter: (spot, percent, barData, index) {
-                            return FlDotCirclePainter(
-                              radius: 4,
-                              color: corDoValor(spot.y),
-                              strokeWidth: 0,
-                            );
-                          },
-                        ),
-                      ),
+                  ],
+                ),
+                lineBarsData: [
+                  LineChartBarData(
+                    spots: [
+                      for (final p in pontos)
+                        FlSpot(posicaoX(p.horario), p.media),
                     ],
-                    lineTouchData: LineTouchData(
-                      touchTooltipData: LineTouchTooltipData(
-                        getTooltipColor: (spot) => corDoValor(spot.y),
-                      ),
-                      getTouchedSpotIndicator: (barData, spotIndexes) {
-                        return spotIndexes.map((index) {
-                          final Color cor =
-                              corDoValor(barData.spots[index].y);
-                          return TouchedSpotIndicatorData(
-                            FlLine(color: cor, strokeWidth: 2),
-                            FlDotData(
-                              getDotPainter: (spot, percent, bar, idx) =>
-                                  FlDotCirclePainter(
+                    isCurved: true,
+                    preventCurveOverShooting: true,
+                    color: Colors.black,
+                    dotData: FlDotData(
+                      show: true,
+                      getDotPainter: (spot, percent, barData, index) =>
+                          FlDotCirclePainter(
+                            radius: 4,
+                            color: _corDoPonto(pontos[index]),
+                            strokeWidth: 0,
+                          ),
+                    ),
+                  ),
+                ],
+                lineTouchData: LineTouchData(
+                  touchTooltipData: LineTouchTooltipData(
+                    getTooltipColor: (spot) =>
+                        _corDoPonto(pontos[spot.spotIndex]),
+                    getTooltipItems: (spots) => [
+                      for (final spot in spots)
+                        LineTooltipItem(
+                          _textoDoBalao(pontos[spot.spotIndex]),
+                          const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                    ],
+                  ),
+                  getTouchedSpotIndicator: (barData, spotIndexes) {
+                    return spotIndexes.map((index) {
+                      final Color cor = _corDoPonto(pontos[index]);
+                      return TouchedSpotIndicatorData(
+                        FlLine(color: cor, strokeWidth: 2),
+                        FlDotData(
+                          getDotPainter: (spot, percent, bar, idx) =>
+                              FlDotCirclePainter(
                                 radius: 6,
                                 color: cor,
                                 strokeWidth: 0,
                               ),
-                            ),
-                          );
-                        }).toList();
-                      },
-                    ),
-                  ),
-                );
-              },
+                        ),
+                      );
+                    }).toList();
+                  },
+                ),
+              ),
             ),
           ),
         ),
       ],
     );
+  }
+
+  String _textoDoBalao(_Ponto p) {
+    if (p.quantidade == 1) {
+      return '${p.media.toStringAsFixed(1)} $unidade\n${_horaCompleta(p.horario)}';
+    }
+    return 'Média ${p.media.toStringAsFixed(1)} $unidade\n'
+        'Máx. ${p.maximo.toStringAsFixed(1)} $unidade\n'
+        '${p.quantidade} leituras · ${_horaMinuto(p.horario)}';
   }
 }
 
@@ -371,9 +577,7 @@ class _MedidaCard extends StatelessWidget {
         Text(label, style: const TextStyle(fontSize: 20)),
         Text(
           valorTexto,
-          style: Theme.of(context)
-              .textTheme
-              .headlineLarge
+          style: Theme.of(context).textTheme.headlineLarge
               ?.copyWith(color: cor, fontWeight: FontWeight.bold),
         ),
       ],

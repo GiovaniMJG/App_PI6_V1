@@ -41,3 +41,7 @@ app.*.map.json
 
 .widget_preview/
 
+
+# Chave privada do Firebase (conta de serviço) - nunca enviar ao GitHub
+chave-firebase.json
+*-firebase-adminsdk-*.json
