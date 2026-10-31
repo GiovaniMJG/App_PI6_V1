@@ -1,0 +1,46 @@
+Dados: dados_simulados.csv - 40320 leituras (7.0 dias), 4.2% em desvio simulado
+  Treino:     24192 leituras (03/08 00:00 a 07/08 04:47), sem rótulos
+  Validação:   8064 leituras (07/08 04:48 a 08/08 14:23), escolha do modelo
+  Teste:       8064 leituras (08/08 14:24 a 09/08 23:59), avaliação final
+
+Validação - F1 por contaminação:
+Entradas           0.01   0.02   0.03   0.04   0.05   0.06   0.08   0.10   0.15
+valores lidos      0.35   0.66   0.87   0.84   0.81   0.79   0.76   0.70   0.53
+perfil diário      0.34   0.66   0.86   0.85   0.80   0.78   0.73   0.67   0.53
+Escolhido: entradas 'valores lidos', contaminação 0.03
+
+Teste (1.4 dias, 424 leituras em desvio):
+Método                             Precisão  Recall     F1  Alarme falso (min/dia)
+Isolation Forest (valores lidos) *     0.96    0.70   0.81                       2
+Isolation Forest (perfil diário)       0.90    0.83   0.86                       7
+Limite fixo (20 °C / 60 %)             0.98    0.51   0.67                       1
+* modelo escolhido na validação
+
+Matriz de confusão do modelo escolhido [[VN, FP], [FN, VP]]:
+[[7629, 11], [127, 297]]
+
+Recall por tipo de desvio (proporção detectada no teste):
+Tipo                 Leituras   Modelo   Limite
+falhaRefrigeracao         280      64%      54%
+picoSensor                  7     100%      57%
+portaAberta                54     100%      67%
+recuperacao                83      69%      30%
+
+Repetições: 10 conjuntos de dados (sementes diferentes), média ± desvio padrão no teste
+Método                                 Precisão       Recall           F1  Alarme falso (min/dia)
+Isolation Forest (valores lidos)      0.93 ±0.03    0.81 ±0.05    0.86 ±0.03                5 ±3
+Isolation Forest (perfil diário)      0.89 ±0.06    0.84 ±0.03    0.87 ±0.03                8 ±5
+Limite fixo (20 °C / 60 %)            0.46 ±0.46    0.75 ±0.18    0.40 ±0.29              367 ±364
+
+Escolhas na validação (entradas / contaminação):
+  perfil diário / 0.04: 4x
+  valores lidos / 0.04: 4x
+  valores lidos / 0.03: 1x
+  perfil diário / 0.03: 1x
+
+Recall médio por tipo de desvio:
+Tipo                   Modelo   Limite
+falhaRefrigeracao         78%      78%
+picoSensor               100%      52%
+portaAberta              100%      79%
+recuperacao               84%      64%

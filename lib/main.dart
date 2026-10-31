@@ -5,8 +5,9 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import 'firebase_options.dart';
 
@@ -29,22 +30,67 @@ const int pontosPorGrafico = 30;
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  await _configurarNotificacoes();
   runApp(const MyApp());
+  // Sem await: sem internet, a inscrição no tópico demora e travaria a abertura.
+  unawaited(_configurarNotificacoes());
 }
 
+// Exibe as notificações enquanto o app está aberto.
+final FlutterLocalNotificationsPlugin _notificacoesLocais =
+    FlutterLocalNotificationsPlugin();
+
+// Canal Android dos alertas; o push com o app fechado usa o mesmo canal
+// (AndroidManifest.xml).
+const AndroidNotificationChannel _canalAlertas = AndroidNotificationChannel(
+  'alertas',
+  'Alertas da estufa',
+  description: 'Temperatura ou umidade fora da faixa segura',
+  importance: Importance.high,
+);
+
 // Push (FCM): inscrição no tópico "alertas", enviado pelo simulador.
-// Tópicos não existem na web.
+// Só no Android: a web não tem tópicos e o iOS não foi configurado.
 Future<void> _configurarNotificacoes() async {
-  if (kIsWeb) return;
+  if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
   try {
+    await _notificacoesLocais.initialize(
+      settings: const InitializationSettings(
+        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      ),
+    );
+    await _notificacoesLocais
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >()
+        ?.createNotificationChannel(_canalAlertas);
+
     final fcm = FirebaseMessaging.instance;
     await fcm.requestPermission();
+    // Com o app aberto, o Android entrega o push ao app sem exibi-lo.
+    FirebaseMessaging.onMessage.listen(_exibirNotificacao);
     await fcm.subscribeToTopic('alertas');
   } catch (erro) {
-    // Falha (ex.: sem internet) não impede o app de abrir.
     debugPrint('Não foi possível ativar as notificações: $erro');
   }
+}
+
+void _exibirNotificacao(RemoteMessage mensagem) {
+  final RemoteNotification? notificacao = mensagem.notification;
+  if (notificacao == null) return;
+  _notificacoesLocais.show(
+    id: mensagem.messageId.hashCode,
+    title: notificacao.title,
+    body: notificacao.body,
+    notificationDetails: NotificationDetails(
+      android: AndroidNotificationDetails(
+        _canalAlertas.id,
+        _canalAlertas.name,
+        channelDescription: _canalAlertas.description,
+        importance: Importance.high,
+        priority: Priority.high,
+      ),
+    ),
+  );
 }
 
 class MyApp extends StatelessWidget {
@@ -53,7 +99,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Estufa Monitor',
+      title: 'Monitor Estufa',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
       ),
@@ -104,8 +150,9 @@ class EstufaHomePage extends StatelessWidget {
           }
 
           final dados = snapshot.data!.data() as Map<String, dynamic>;
-          final double temperatura = dados['temperatura'] as double;
-          final double umidade = dados['umidade'] as double;
+          // num: aceita valor gravado como inteiro (ex.: firmware do ESP32).
+          final double temperatura = (dados['temperatura'] as num).toDouble();
+          final double umidade = (dados['umidade'] as num).toDouble();
 
           final bool temperaturaPerigo = temperatura > temperaturaMax;
           final bool umidadePerigo = umidade > umidadeMax;
@@ -147,8 +194,8 @@ class EstufaHomePage extends StatelessWidget {
 }
 
 // Leitura do histórico.
-class _Leitura {
-  const _Leitura(this.horario, this.temperatura, this.umidade);
+class LeituraHistorico {
+  const LeituraHistorico(this.horario, this.temperatura, this.umidade);
 
   final DateTime horario;
   final double temperatura;
@@ -156,8 +203,8 @@ class _Leitura {
 }
 
 // Ponto do gráfico: média das leituras de uma faixa de tempo.
-class _Ponto {
-  const _Ponto({
+class PontoGrafico {
+  const PontoGrafico({
     required this.horario,
     required this.media,
     required this.maximo,
@@ -260,7 +307,7 @@ class _PainelHistoricoState extends State<_PainelHistorico> {
             final leituras = [
               for (final doc in snapshot.data!.docs)
                 if (doc.data() case final Map<String, dynamic> dados)
-                  _Leitura(
+                  LeituraHistorico(
                     (dados['timestamp'] as Timestamp).toDate(),
                     (dados['temperatura'] as num).toDouble(),
                     (dados['umidade'] as num).toDouble(),
@@ -288,7 +335,12 @@ class _PainelHistoricoState extends State<_PainelHistorico> {
                   eixoMax: temperaturaGraficoMax,
                   inicio: inicio,
                   periodo: _periodo,
-                  pontos: _agrupar(leituras, inicio, (l) => l.temperatura),
+                  pontos: agruparLeituras(
+                    leituras,
+                    inicio,
+                    _periodo.duracao,
+                    (l) => l.temperatura,
+                  ),
                 ),
                 const SizedBox(height: 24),
                 _GraficoHistorico(
@@ -299,7 +351,12 @@ class _PainelHistoricoState extends State<_PainelHistorico> {
                   eixoMax: umidadeGraficoMax,
                   inicio: inicio,
                   periodo: _periodo,
-                  pontos: _agrupar(leituras, inicio, (l) => l.umidade),
+                  pontos: agruparLeituras(
+                    leituras,
+                    inicio,
+                    _periodo.duracao,
+                    (l) => l.umidade,
+                  ),
                 ),
               ],
             );
@@ -308,42 +365,41 @@ class _PainelHistoricoState extends State<_PainelHistorico> {
       ],
     );
   }
+}
 
-  // Agrupa as leituras em faixas de tempo iguais (média e máximo).
-  List<_Ponto> _agrupar(
-    List<_Leitura> leituras,
-    DateTime inicio,
-    double Function(_Leitura) valorDe,
-  ) {
-    final double segundosPorFaixa =
-        _periodo.duracao.inSeconds / pontosPorGrafico;
-    final faixas = <int, List<_Leitura>>{};
-    for (final l in leituras) {
-      final int indice =
-          (l.horario.difference(inicio).inSeconds / segundosPorFaixa)
-              .floor()
-              .clamp(0, pontosPorGrafico - 1);
-      faixas.putIfAbsent(indice, () => []).add(l);
-    }
-
-    final indices = faixas.keys.toList()..sort();
-    return [
-      for (final i in indices)
-        _Ponto(
-          horario: DateTime.fromMillisecondsSinceEpoch(
-            faixas[i]!
-                    .map((l) => l.horario.millisecondsSinceEpoch)
-                    .reduce((a, b) => a + b) ~/
-                faixas[i]!.length,
-          ),
-          media:
-              faixas[i]!.map(valorDe).reduce((a, b) => a + b) /
-              faixas[i]!.length,
-          maximo: faixas[i]!.map(valorDe).reduce(math.max),
-          quantidade: faixas[i]!.length,
-        ),
-    ];
+// Agrupa as leituras em faixas de tempo iguais (média e máximo).
+List<PontoGrafico> agruparLeituras(
+  List<LeituraHistorico> leituras,
+  DateTime inicio,
+  Duration duracao,
+  double Function(LeituraHistorico) valorDe,
+) {
+  final double segundosPorFaixa = duracao.inSeconds / pontosPorGrafico;
+  final faixas = <int, List<LeituraHistorico>>{};
+  for (final l in leituras) {
+    final int indice =
+        (l.horario.difference(inicio).inSeconds / segundosPorFaixa)
+            .floor()
+            .clamp(0, pontosPorGrafico - 1);
+    faixas.putIfAbsent(indice, () => []).add(l);
   }
+
+  final indices = faixas.keys.toList()..sort();
+  return [
+    for (final i in indices)
+      PontoGrafico(
+        horario: DateTime.fromMillisecondsSinceEpoch(
+          faixas[i]!
+                  .map((l) => l.horario.millisecondsSinceEpoch)
+                  .reduce((a, b) => a + b) ~/
+              faixas[i]!.length,
+        ),
+        media:
+            faixas[i]!.map(valorDe).reduce((a, b) => a + b) / faixas[i]!.length,
+        maximo: faixas[i]!.map(valorDe).reduce(math.max),
+        quantidade: faixas[i]!.length,
+      ),
+  ];
 }
 
 class _GraficoHistorico extends StatelessWidget {
@@ -365,10 +421,10 @@ class _GraficoHistorico extends StatelessWidget {
   final double eixoMax;
   final DateTime inicio;
   final PeriodoHistorico periodo;
-  final List<_Ponto> pontos;
+  final List<PontoGrafico> pontos;
 
   // Usa o máximo da faixa, para um desvio curto não sumir na média.
-  Color _corDoPonto(_Ponto ponto) =>
+  Color _corDoPonto(PontoGrafico ponto) =>
       ponto.maximo > limite ? corPerigo : corSegura;
 
   @override
@@ -503,7 +559,7 @@ class _GraficoHistorico extends StatelessWidget {
     );
   }
 
-  String _textoDoBalao(_Ponto p) {
+  String _textoDoBalao(PontoGrafico p) {
     if (p.quantidade == 1) {
       return '${p.media.toStringAsFixed(1)} $unidade\n${_horaCompleta(p.horario)}';
     }
@@ -511,6 +567,15 @@ class _GraficoHistorico extends StatelessWidget {
         'Máx. ${p.maximo.toStringAsFixed(1)} $unidade\n'
         '${p.quantidade} leituras · ${_horaMinuto(p.horario)}';
   }
+}
+
+// Texto do banner de leitura fora da faixa.
+String textoAlerta({required bool temperatura, required bool umidade}) {
+  final List<String> alterados = [
+    if (temperatura) 'Temperatura',
+    if (umidade) 'Umidade',
+  ];
+  return 'Atenção: ${alterados.join(' e ')} fora da faixa segura!';
 }
 
 class _AlertaPerigo extends StatelessWidget {
@@ -524,12 +589,10 @@ class _AlertaPerigo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final List<String> alterados = [
-      if (temperaturaPerigo) 'Temperatura',
-      if (umidadePerigo) 'Umidade',
-    ];
-    final String mensagem =
-        'Atenção: ${alterados.join(' e ')} fora da faixa segura!';
+    final String mensagem = textoAlerta(
+      temperatura: temperaturaPerigo,
+      umidade: umidadePerigo,
+    );
 
     return Container(
       width: double.infinity,

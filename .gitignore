@@ -45,3 +45,12 @@ app.*.map.json
 # Chave privada do Firebase (conta de serviço) - nunca enviar ao GitHub
 chave-firebase.json
 *-firebase-adminsdk-*.json
+
+# Dados gerados para as repetições do ML (recriáveis com --repeticoes)
+ml/repeticoes/
+
+# Ficha FOR 6.3.3 da empresa e saídas com os valores dela (dados internos)
+ml/ficha_for633_agosto2026.csv
+ml/calibracao.png
+ml/calibracao.txt
+ml/calibracao_validacao.txt

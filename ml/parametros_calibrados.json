@@ -1,0 +1,13 @@
+{
+  "temp_min": 17.8434,
+  "amplitude": 2.2463,
+  "dp_temp": 0.7761,
+  "dp_amplitude": 1.8967,
+  "hora_min": 9.901,
+  "hora_pico": 17.6916,
+  "ruido_temp": 0.0857,
+  "umid_max": 56.1875,
+  "queda_umid": 2.2527,
+  "dp_umid": 1.5038,
+  "ruido_umid": 0.3825
+}

@@ -16,7 +16,7 @@ final Uri leituraAtualUrl = Uri.parse(basePath);
 
 final Uri historicoUrl = Uri.parse('$basePath/historico');
 
-final Random random = Random();
+Random random = Random();
 
 // Mesmos limites do app (lib/main.dart).
 const double temperaturaMax = 20.0;
@@ -73,12 +73,28 @@ Future<void> enviarPush(
   }
 }
 
-// Condição normal da sala.
-const double temperaturaBase = 18.0;
-const double umidadeBase = 52.0;
+// Comportamento normal calibrado com a ficha FOR 6.3.3 (agosto/2026) por
+// ml/calibrar_simulador.py: a sala esfria até o meio da manhã, esquenta até o
+// fim da tarde e a umidade faz o caminho inverso.
+const double temperaturaMinimaDia = 17.84;
+const double subidaDia = 2.25;
+const double variacaoTemperaturaDia = 0.78;
+const double variacaoSubidaDia = 1.90;
+const double horaMaisFria = 9.90;
+const double horaPico = 17.69;
+const double ruidoTemperatura = 0.086;
+const double umidadeMaximaDia = 56.19;
+const double quedaUmidadePorGrau = 2.25;
+const double variacaoUmidadeDia = 1.50;
+const double ruidoUmidade = 0.382;
 
-// Probabilidade de desvio por leitura (~1 a cada 12 min).
-const double chanceDesvio = 0.02;
+// Probabilidade de desvio por leitura (~1 por hora). Não vem da ficha:
+// escolhida para haver eventos suficientes na avaliação do modelo.
+const double chanceDesvio = 0.004;
+
+// Folga para encerrar um alerta (evita push repetido com o valor oscilando no limite).
+const double folgaTemperatura = 0.5;
+const double folgaUmidade = 2.0;
 
 // Desvios simulados; leituras afetadas são marcadas (desvioSimulado),
 // servindo de gabarito para avaliar o modelo de ML.
@@ -103,27 +119,217 @@ double arredonda(double valor) =>
 // Valor aleatório em [-amplitude, +amplitude].
 double ruido(double amplitude) => (random.nextDouble() * 2 - 1) * amplitude;
 
-Future<void> main() async {
-  final http.Client? clientePush = await criarClientePush();
+// Valor aleatório com distribuição normal padrão (Box-Muller).
+double normal() =>
+    sqrt(-2 * log(1 - random.nextDouble())) * cos(2 * pi * random.nextDouble());
 
-  // Push só na transição para fora da faixa.
-  bool temperaturaForaAntes = false;
-  bool umidadeForaAntes = false;
+// Formato do ciclo diário: 0 na hora mais fria, 1 no pico.
+double formaDiaria(double hora) {
+  const double subida = (horaPico - horaMaisFria) % 24;
+  final double u = (hora - horaMaisFria) % 24;
+  return u < subida
+      ? (1 - cos(pi * u / subida)) / 2
+      : (1 + cos(pi * (u - subida) / (24 - subida))) / 2;
+}
 
-  double temperatura = temperaturaBase;
-  double umidade = umidadeBase;
+// Variação sorteada para cada dia (temperatura mínima, subida e umidade).
+class SorteioDia {
+  SorteioDia() : base = normal(), subida = normal(), umidade = normal();
+
+  final double base;
+  final double subida;
+  final double umidade;
+}
+
+class Leitura {
+  const Leitura(this.temperatura, this.umidade, this.emDesvio, this.tipo);
+
+  final double temperatura;
+  final double umidade;
+  final bool emDesvio;
+  final String tipo;
+}
+
+// Estado do sensor simulado; gera uma leitura por chamada.
+class SensorSimulado {
+  double? _temperatura;
+  double? _umidade;
+
+  DateTime? _dia;
+  SorteioDia _hoje = SorteioDia();
+  SorteioDia _amanha = SorteioDia();
 
   // Acréscimo do desvio em andamento.
-  double extraTemperatura = 0;
-  double extraUmidade = 0;
+  double _extraTemperatura = 0;
+  double _extraUmidade = 0;
 
-  TipoDesvio? desvioAtual;
-  int leiturasRestantes = 0;
-  TipoDesvio? desvioPedido; // escolhido pelo teclado
+  TipoDesvio? _desvioAtual;
+  int _leiturasRestantes = 0;
+
+  bool desviosAleatorios = true;
+
+  // Desvio pedido pelo teclado; aplicado quando não há outro em andamento.
+  TipoDesvio? desvioPedido;
+
+  void _avancarDia(DateTime horario) {
+    final dia = DateTime(horario.year, horario.month, horario.day);
+    _dia ??= dia;
+    while (_dia!.isBefore(dia)) {
+      _hoje = _amanha;
+      _amanha = SorteioDia();
+      _dia = DateTime(_dia!.year, _dia!.month, _dia!.day + 1);
+    }
+  }
+
+  Leitura proxima(DateTime horario) {
+    _avancarDia(horario);
+
+    // Curva normal do horário, com a variação do dia interpolada.
+    final double hora =
+        horario.hour + horario.minute / 60 + horario.second / 3600;
+    final double frac = hora / 24;
+    double interpola(double a, double b) => a + (b - a) * frac;
+    final double forma = formaDiaria(hora);
+    final double subida =
+        max(
+          0.0,
+          subidaDia +
+              variacaoSubidaDia * interpola(_hoje.subida, _amanha.subida),
+        ) *
+        forma;
+    final double alvoTemperatura =
+        temperaturaMinimaDia +
+        variacaoTemperaturaDia * interpola(_hoje.base, _amanha.base) +
+        subida;
+    final double alvoUmidade =
+        umidadeMaximaDia +
+        variacaoUmidadeDia * interpola(_hoje.umidade, _amanha.umidade) -
+        quedaUmidadePorGrau * subidaDia * forma;
+
+    // Oscilação em torno da curva, com retorno gradual a ela.
+    double temperatura = _temperatura ?? alvoTemperatura;
+    double umidade = _umidade ?? alvoUmidade;
+    temperatura +=
+        (alvoTemperatura - temperatura) * 0.1 + ruido(ruidoTemperatura);
+    umidade += (alvoUmidade - umidade) * 0.1 + ruido(ruidoUmidade);
+    _temperatura = temperatura;
+    _umidade = umidade;
+
+    // Início de desvio (pedido ou sorteio).
+    if (_desvioAtual == null && _extraTemperatura.abs() < 0.3) {
+      if (desvioPedido != null) {
+        _desvioAtual = desvioPedido;
+        desvioPedido = null;
+      } else if (desviosAleatorios && random.nextDouble() < chanceDesvio) {
+        _desvioAtual =
+            TipoDesvio.values[random.nextInt(TipoDesvio.values.length)];
+      }
+      _leiturasRestantes = _desvioAtual?.leituras ?? 0;
+    }
+
+    // Efeito do desvio.
+    double pico = 0;
+    final desvio = _desvioAtual;
+    if (desvio != null) {
+      if (desvio == TipoDesvio.picoSensor) {
+        // Leitura isolada errada; para baixo fica dentro da faixa.
+        pico = (random.nextBool() ? 1 : -1) * (2.5 + random.nextDouble());
+      } else {
+        _extraTemperatura += desvio.passoTemperatura;
+        _extraUmidade += desvio.passoUmidade;
+      }
+      _leiturasRestantes--;
+    } else {
+      // Retorno gradual ao normal.
+      _extraTemperatura *= 0.6;
+      _extraUmidade *= 0.6;
+    }
+
+    final bool emDesvio =
+        desvio != null ||
+        _extraTemperatura.abs() > 0.5 ||
+        _extraUmidade.abs() > 2;
+    final String tipo = desvio?.name ?? (emDesvio ? 'recuperacao' : '');
+
+    if (_leiturasRestantes <= 0) _desvioAtual = null;
+
+    return Leitura(
+      arredonda((temperatura + _extraTemperatura + pico).clamp(-40.0, 80.0)),
+      arredonda((umidade + _extraUmidade).clamp(0.0, 100.0)),
+      emDesvio,
+      tipo,
+    );
+  }
+}
+
+// Gera leituras em CSV a partir de 03/08/2026 (segunda-feira, mês da ficha
+// FOR 6.3.3), sem acessar o Firebase.
+void gerarCsv(int quantidade, String caminho, {bool comDesvios = true}) {
+  final sensor = SensorSimulado()..desviosAleatorios = comDesvios;
+  final inicio = DateTime(2026, 8, 3);
+  final saida = StringBuffer(
+    'timestamp,temperatura,umidade,desvioSimulado,tipoDesvio\n',
+  );
+  for (int i = 0; i < quantidade; i++) {
+    final horario = inicio.add(Duration(seconds: 15 * i));
+    final l = sensor.proxima(horario);
+    saida.writeln(
+      '${horario.toUtc().toIso8601String()},${l.temperatura},${l.umidade},'
+      '${l.emDesvio ? 1 : 0},${l.tipo}',
+    );
+  }
+  File(caminho)
+    ..createSync(recursive: true)
+    ..writeAsStringSync(saida.toString());
+  print('$quantidade leituras gravadas em $caminho');
+}
+
+// Valor depois de uma opção da linha de comando (ex.: --seed 3).
+String? valorDe(List<String> args, String opcao) {
+  final int i = args.indexOf(opcao);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : null;
+}
+
+Future<void> main(List<String> args) async {
+  // Modo CSV: dart run bin/simulador_esp32.dart --csv 40320 [--seed 1]
+  //   [--sem-desvios] [--saida caminho] [--repeticoes 10]
+  if (args.contains('--csv')) {
+    final int quantidade = int.tryParse(valorDe(args, '--csv') ?? '') ?? 40320;
+    final int semente = int.tryParse(valorDe(args, '--seed') ?? '') ?? 1;
+    final int repeticoes =
+        int.tryParse(valorDe(args, '--repeticoes') ?? '') ?? 0;
+    final bool comDesvios = !args.contains('--sem-desvios');
+    if (repeticoes > 0) {
+      for (int r = 0; r < repeticoes; r++) {
+        random = Random(semente + r);
+        final nome = (semente + r).toString().padLeft(2, '0');
+        gerarCsv(
+          quantidade,
+          'ml/repeticoes/dados_$nome.csv',
+          comDesvios: comDesvios,
+        );
+      }
+    } else {
+      random = Random(semente);
+      gerarCsv(
+        quantidade,
+        valorDe(args, '--saida') ?? 'ml/dados_simulados.csv',
+        comDesvios: comDesvios,
+      );
+    }
+    return;
+  }
+
+  final http.Client? clientePush = await criarClientePush();
+  final sensor = SensorSimulado();
+
+  // Alerta ativo: push só ao sair da faixa, encerrado com folga abaixo do limite.
+  bool alertaTemperatura = false;
+  bool alertaUmidade = false;
 
   // Desvio manual pelo teclado: p, f ou s + Enter.
   stdin.transform(utf8.decoder).transform(const LineSplitter()).listen((linha) {
-    desvioPedido = switch (linha.trim().toLowerCase()) {
+    sensor.desvioPedido = switch (linha.trim().toLowerCase()) {
       'p' => TipoDesvio.portaAberta,
       'f' => TipoDesvio.falhaRefrigeracao,
       's' => TipoDesvio.picoSensor,
@@ -138,61 +344,16 @@ Future<void> main() async {
   );
 
   while (true) {
-    // Oscilação normal, com retorno ao valor base.
-    temperatura += (temperaturaBase - temperatura) * 0.1 + ruido(0.2);
-    umidade += (umidadeBase - umidade) * 0.1 + ruido(0.8);
-
-    // Início de desvio (teclado ou sorteio).
-    if (desvioAtual == null && extraTemperatura.abs() < 0.3) {
-      if (desvioPedido != null) {
-        desvioAtual = desvioPedido;
-        desvioPedido = null;
-      } else if (random.nextDouble() < chanceDesvio) {
-        desvioAtual =
-            TipoDesvio.values[random.nextInt(TipoDesvio.values.length)];
-      }
-      leiturasRestantes = desvioAtual?.leituras ?? 0;
-    }
-
-    // Efeito do desvio.
-    double pico = 0;
-    if (desvioAtual != null) {
-      if (desvioAtual == TipoDesvio.picoSensor) {
-        // Leitura isolada errada; para baixo fica dentro da faixa.
-        pico = (random.nextBool() ? 1 : -1) * (2.5 + random.nextDouble());
-      } else {
-        extraTemperatura += desvioAtual.passoTemperatura;
-        extraUmidade += desvioAtual.passoUmidade;
-      }
-      leiturasRestantes--;
-    } else {
-      // Retorno gradual ao normal.
-      extraTemperatura *= 0.6;
-      extraUmidade *= 0.6;
-    }
-
-    final bool emDesvio =
-        desvioAtual != null ||
-        extraTemperatura.abs() > 0.5 ||
-        extraUmidade.abs() > 2;
-    final String tipo = desvioAtual?.name ?? (emDesvio ? 'recuperacao' : '');
-
-    final double temperaturaLida = arredonda(
-      (temperatura + extraTemperatura + pico).clamp(-40.0, 80.0),
-    );
-    final double umidadeLida = arredonda(
-      (umidade + extraUmidade).clamp(0.0, 100.0),
-    );
-
-    if (leiturasRestantes <= 0) desvioAtual = null;
+    final leitura = sensor.proxima(DateTime.now());
 
     final agora = DateTime.now().toUtc().toIso8601String();
     final campos = {
-      'temperatura': {'doubleValue': temperaturaLida},
-      'umidade': {'doubleValue': umidadeLida},
+      'temperatura': {'doubleValue': leitura.temperatura},
+      'umidade': {'doubleValue': leitura.umidade},
       'timestamp': {'timestampValue': agora},
-      'desvioSimulado': {'booleanValue': emDesvio},
-      'tipoDesvio': {'stringValue': tipo},
+      'desvioSimulado': {'booleanValue': leitura.emDesvio},
+      'tipoDesvio': {'stringValue': leitura.tipo},
+      'versaoSimulador': {'integerValue': '2'},
     };
 
     try {
@@ -211,33 +372,37 @@ Future<void> main() async {
       if (respostaAtual.statusCode == 200 &&
           respostaHistorico.statusCode == 200) {
         print(
-          'Enviado: temperatura=${temperaturaLida.toStringAsFixed(1)}°C '
-          'umidade=${umidadeLida.toStringAsFixed(1)}%'
-          '${emDesvio ? '  [desvio: $tipo]' : ''}',
+          'Enviado: temperatura=${leitura.temperatura.toStringAsFixed(1)}°C '
+          'umidade=${leitura.umidade.toStringAsFixed(1)}%'
+          '${leitura.emDesvio ? '  [desvio: ${leitura.tipo}]' : ''}',
         );
 
-        final bool temperaturaFora = temperaturaLida > temperaturaMax;
-        final bool umidadeFora = umidadeLida > umidadeMax;
-        if (clientePush != null) {
-          if (temperaturaFora && !temperaturaForaAntes) {
+        if (leitura.temperatura > temperaturaMax && !alertaTemperatura) {
+          alertaTemperatura = true;
+          if (clientePush != null) {
             await enviarPush(
               clientePush,
-              'Temperatura acima do limite',
-              'Sala de amostras: ${temperaturaLida.toStringAsFixed(1)} °C '
+              'Atenção: temperatura fora da faixa segura',
+              'Sala de amostras: ${leitura.temperatura.toStringAsFixed(1)} °C '
                   '(limite ${temperaturaMax.toStringAsFixed(0)} °C)',
             );
           }
-          if (umidadeFora && !umidadeForaAntes) {
+        } else if (leitura.temperatura <= temperaturaMax - folgaTemperatura) {
+          alertaTemperatura = false;
+        }
+        if (leitura.umidade > umidadeMax && !alertaUmidade) {
+          alertaUmidade = true;
+          if (clientePush != null) {
             await enviarPush(
               clientePush,
-              'Umidade acima do limite',
-              'Sala de amostras: ${umidadeLida.toStringAsFixed(1)} % '
+              'Atenção: umidade fora da faixa segura',
+              'Sala de amostras: ${leitura.umidade.toStringAsFixed(1)} % '
                   '(limite ${umidadeMax.toStringAsFixed(0)} %)',
             );
           }
+        } else if (leitura.umidade <= umidadeMax - folgaUmidade) {
+          alertaUmidade = false;
         }
-        temperaturaForaAntes = temperaturaFora;
-        umidadeForaAntes = umidadeFora;
       } else {
         print(
           'Erro atual=${respostaAtual.statusCode} '
