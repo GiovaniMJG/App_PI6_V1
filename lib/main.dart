@@ -10,13 +10,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import 'firebase_options.dart';
+import 'registros.dart';
 
 // Períodos do histórico.
 enum PeriodoHistorico {
+  cincoMinutos('5 min', Duration(minutes: 5), 1),
+  quinzeMinutos('15 min', Duration(minutes: 15), 5),
   meiaHora('30 min', Duration(minutes: 30), 10),
-  umaHora('1 h', Duration(hours: 1), 15),
-  duasHoras('2 h', Duration(hours: 2), 30),
-  quatroHoras('4 h', Duration(hours: 4), 60);
+  umaHora('1 h', Duration(hours: 1), 15);
 
   final String label;
   final Duration duracao;
@@ -103,7 +104,41 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
       ),
-      home: const EstufaHomePage(),
+      home: const _TelaPrincipal(),
+    );
+  }
+}
+
+// Barra inferior com as abas "Agora" e "Registros".
+class _TelaPrincipal extends StatefulWidget {
+  const _TelaPrincipal();
+
+  @override
+  State<_TelaPrincipal> createState() => _TelaPrincipalState();
+}
+
+class _TelaPrincipalState extends State<_TelaPrincipal> {
+  int _aba = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      // IndexedStack mantém as duas abas vivas (sem recarregar ao trocar).
+      body: IndexedStack(
+        index: _aba,
+        children: const [EstufaHomePage(), RegistrosPage()],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _aba,
+        onDestinationSelected: (i) => setState(() => _aba = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.thermostat), label: 'Agora'),
+          NavigationDestination(
+            icon: Icon(Icons.event_note),
+            label: 'Registros',
+          ),
+        ],
+      ),
     );
   }
 }
@@ -127,6 +162,7 @@ String _horaMinuto(DateTime t) =>
     '${_doisDigitos(t.hour)}:${_doisDigitos(t.minute)}';
 String _horaCompleta(DateTime t) =>
     '${_horaMinuto(t)}:${_doisDigitos(t.second)}';
+String _diaMes(DateTime t) => '${_doisDigitos(t.day)}/${_doisDigitos(t.month)}';
 
 class EstufaHomePage extends StatelessWidget {
   const EstufaHomePage({super.key});
@@ -172,13 +208,13 @@ class EstufaHomePage extends StatelessWidget {
                 const SizedBox(height: 24),
                 _MedidaCard(
                   label: 'Temperatura',
-                  valorTexto: '${temperatura.toStringAsFixed(1)} °C',
+                  valorTexto: '${decimal(temperatura)} °C',
                   perigo: temperaturaPerigo,
                 ),
                 const SizedBox(height: 32),
                 _MedidaCard(
                   label: 'Umidade',
-                  valorTexto: '${umidade.toStringAsFixed(1)} %',
+                  valorTexto: '${decimal(umidade)} %',
                   perigo: umidadePerigo,
                 ),
                 const SizedBox(height: 32),
@@ -206,14 +242,21 @@ class LeituraHistorico {
 class PontoGrafico {
   const PontoGrafico({
     required this.horario,
+    required this.primeira,
+    required this.ultima,
     required this.media,
     required this.maximo,
+    required this.horarioMaximo,
     required this.quantidade,
   });
 
-  final DateTime horario; // horário médio das leituras da faixa
+  final DateTime
+  horario; // horário médio das leituras da faixa (posição no eixo X)
+  final DateTime primeira; // captura da primeira leitura da faixa
+  final DateTime ultima; // captura da última leitura da faixa
   final double media;
   final double maximo;
+  final DateTime horarioMaximo; // captura da leitura de valor máximo
   final int quantidade;
 }
 
@@ -226,7 +269,7 @@ class _PainelHistorico extends StatefulWidget {
 }
 
 class _PainelHistoricoState extends State<_PainelHistorico> {
-  PeriodoHistorico _periodo = PeriodoHistorico.umaHora;
+  PeriodoHistorico _periodo = PeriodoHistorico.quinzeMinutos;
   late DateTime _inicioConsulta;
   late Stream<QuerySnapshot> _consulta;
   late final Timer _relogio;
@@ -385,21 +428,29 @@ List<PontoGrafico> agruparLeituras(
   }
 
   final indices = faixas.keys.toList()..sort();
-  return [
-    for (final i in indices)
-      PontoGrafico(
-        horario: DateTime.fromMillisecondsSinceEpoch(
-          faixas[i]!
-                  .map((l) => l.horario.millisecondsSinceEpoch)
-                  .reduce((a, b) => a + b) ~/
-              faixas[i]!.length,
-        ),
-        media:
-            faixas[i]!.map(valorDe).reduce((a, b) => a + b) / faixas[i]!.length,
-        maximo: faixas[i]!.map(valorDe).reduce(math.max),
-        quantidade: faixas[i]!.length,
-      ),
-  ];
+  return [for (final i in indices) _resumirFaixa(faixas[i]!, valorDe)];
+}
+
+PontoGrafico _resumirFaixa(
+  List<LeituraHistorico> faixa,
+  double Function(LeituraHistorico) valorDe,
+) {
+  final horarios = faixa.map((l) => l.horario).toList()..sort();
+  final LeituraHistorico leituraMaxima = faixa.reduce(
+    (a, b) => valorDe(b) > valorDe(a) ? b : a,
+  );
+  return PontoGrafico(
+    horario: DateTime.fromMillisecondsSinceEpoch(
+      horarios.map((t) => t.millisecondsSinceEpoch).reduce((a, b) => a + b) ~/
+          faixa.length,
+    ),
+    primeira: horarios.first,
+    ultima: horarios.last,
+    media: faixa.map(valorDe).reduce((a, b) => a + b) / faixa.length,
+    maximo: valorDe(leituraMaxima),
+    horarioMaximo: leituraMaxima.horario,
+    quantidade: faixa.length,
+  );
 }
 
 class _GraficoHistorico extends StatelessWidget {
@@ -521,6 +572,9 @@ class _GraficoHistorico extends StatelessWidget {
                 ],
                 lineTouchData: LineTouchData(
                   touchTooltipData: LineTouchTooltipData(
+                    maxContentWidth: 260,
+                    fitInsideHorizontally: true,
+                    fitInsideVertically: true,
                     getTooltipColor: (spot) =>
                         _corDoPonto(pontos[spot.spotIndex]),
                     getTooltipItems: (spots) => [
@@ -561,11 +615,15 @@ class _GraficoHistorico extends StatelessWidget {
 
   String _textoDoBalao(PontoGrafico p) {
     if (p.quantidade == 1) {
-      return '${p.media.toStringAsFixed(1)} $unidade\n${_horaCompleta(p.horario)}';
+      return '${_diaMes(p.primeira)} às ${_horaCompleta(p.primeira)}\n'
+          '${decimal(p.media)} $unidade';
     }
-    return 'Média ${p.media.toStringAsFixed(1)} $unidade\n'
-        'Máx. ${p.maximo.toStringAsFixed(1)} $unidade\n'
-        '${p.quantidade} leituras · ${_horaMinuto(p.horario)}';
+    return '${_diaMes(p.primeira)}, ${_horaCompleta(p.primeira)} '
+        'a ${_horaCompleta(p.ultima)}\n'
+        'Média ${decimal(p.media)} $unidade '
+        '(${p.quantidade} leituras)\n'
+        'Máx. ${decimal(p.maximo)} $unidade '
+        'às ${_horaCompleta(p.horarioMaximo)}';
   }
 }
 

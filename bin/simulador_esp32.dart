@@ -16,6 +16,21 @@ final Uri leituraAtualUrl = Uri.parse(basePath);
 
 final Uri historicoUrl = Uri.parse('$basePath/historico');
 
+// Registros no formato da ficha FOR 6.3.3 (um documento por manhã/tarde).
+const String caminhoRegistros =
+    'projects/$projectId/databases/(default)/documents'
+    '/estufa/leitura_atual/registros';
+final Uri commitUrl = Uri.parse(
+  'https://firestore.googleapis.com/v1/projects/$projectId'
+  '/databases/(default)/documents:commit',
+);
+
+// Horários dos registros, como na ficha: (hora, minuto, período).
+const List<(int, int, String)> horariosRegistro = [
+  (7, 30, 'manha'),
+  (16, 0, 'tarde'),
+];
+
 Random random = Random();
 
 // Mesmos limites do app (lib/main.dart).
@@ -101,7 +116,9 @@ const double folgaUmidade = 2.0;
 enum TipoDesvio {
   portaAberta(leituras: 6, passoTemperatura: 0.5, passoUmidade: 2.0),
   falhaRefrigeracao(leituras: 20, passoTemperatura: 0.25, passoUmidade: 0.3),
-  picoSensor(leituras: 1, passoTemperatura: 0, passoUmidade: 0);
+  picoSensor(leituras: 1, passoTemperatura: 0, passoUmidade: 0),
+  // Só pelo teclado (demonstração); fora do sorteio, não altera os dados do ML.
+  umidadeAlta(leituras: 8, passoTemperatura: 0, passoUmidade: 1.5);
 
   final int leituras;
   final double passoTemperatura;
@@ -112,6 +129,12 @@ enum TipoDesvio {
     required this.passoUmidade,
   });
 }
+
+const List<TipoDesvio> desviosSorteados = [
+  TipoDesvio.portaAberta,
+  TipoDesvio.falhaRefrigeracao,
+  TipoDesvio.picoSensor,
+];
 
 double arredonda(double valor) =>
     (valor * 10).round() / 10; // resolução do DHT22
@@ -222,7 +245,7 @@ class SensorSimulado {
         desvioPedido = null;
       } else if (desviosAleatorios && random.nextDouble() < chanceDesvio) {
         _desvioAtual =
-            TipoDesvio.values[random.nextInt(TipoDesvio.values.length)];
+            desviosSorteados[random.nextInt(desviosSorteados.length)];
       }
       _leiturasRestantes = _desvioAtual?.leituras ?? 0;
     }
@@ -284,6 +307,116 @@ void gerarCsv(int quantidade, String caminho, {bool comDesvios = true}) {
   print('$quantidade leituras gravadas em $caminho');
 }
 
+// Mínima e máxima desde o último registro, como o termohigrômetro da ficha.
+class Acumulador {
+  double? tempMin, tempMax, umidMin, umidMax;
+
+  void adicionar(Leitura l) {
+    tempMin = min(tempMin ?? l.temperatura, l.temperatura);
+    tempMax = max(tempMax ?? l.temperatura, l.temperatura);
+    umidMin = min(umidMin ?? l.umidade, l.umidade);
+    umidMax = max(umidMax ?? l.umidade, l.umidade);
+  }
+
+  void zerar() => tempMin = tempMax = umidMin = umidMax = null;
+}
+
+// Próximo horário de registro depois de [depois].
+(DateTime, String) proximoRegistro(DateTime depois) {
+  for (int dia = 0; dia < 2; dia++) {
+    for (final (hora, minuto, periodo) in horariosRegistro) {
+      final t = DateTime(
+        depois.year,
+        depois.month,
+        depois.day + dia,
+        hora,
+        minuto,
+      );
+      if (t.isAfter(depois)) return (t, periodo);
+    }
+  }
+  throw StateError('Nenhum horário de registro configurado.');
+}
+
+String _dois(int n) => n.toString().padLeft(2, '0');
+String chaveData(DateTime t) => '${t.year}-${_dois(t.month)}-${_dois(t.day)}';
+
+// Documento do registro; o id (data_período) evita duplicar o mesmo registro.
+Map<String, dynamic> documentoRegistro(
+  DateTime horario,
+  String periodo,
+  Leitura atual,
+  Acumulador acumulado,
+  String origem,
+) => {
+  'name': '$caminhoRegistros/${chaveData(horario)}_$periodo',
+  'fields': {
+    'data': {'stringValue': chaveData(horario)},
+    'periodo': {'stringValue': periodo},
+    'timestamp': {'timestampValue': horario.toUtc().toIso8601String()},
+    'tempAtual': {'doubleValue': atual.temperatura},
+    'tempMin': {'doubleValue': acumulado.tempMin},
+    'tempMax': {'doubleValue': acumulado.tempMax},
+    'umidAtual': {'doubleValue': atual.umidade},
+    'umidMin': {'doubleValue': acumulado.umidMin},
+    'umidMax': {'doubleValue': acumulado.umidMax},
+    'origem': {'stringValue': origem},
+  },
+};
+
+// Grava documentos de uma vez (até 500 por requisição).
+Future<void> gravarDocumentos(List<Map<String, dynamic>> documentos) async {
+  for (int i = 0; i < documentos.length; i += 500) {
+    final lote = documentos.sublist(i, min(i + 500, documentos.length));
+    final resposta = await http.post(
+      commitUrl,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'writes': [
+          for (final d in lote) {'update': d},
+        ],
+      }),
+    );
+    if (resposta.statusCode != 200) {
+      throw HttpException('Erro ${resposta.statusCode}: ${resposta.body}');
+    }
+  }
+}
+
+// Registros de 03/08/2026 até agora com o modelo calibrado (sem desvios),
+// para a aba Registros já ter meses de dados.
+Future<void> gerarRegistrosRetroativos() async {
+  random = Random(1);
+  final sensor = SensorSimulado()..desviosAleatorios = false;
+  final acumulado = Acumulador();
+  final fim = DateTime.now();
+  DateTime horario = DateTime(2026, 8, 3);
+  (DateTime, String) proximo = proximoRegistro(horario);
+  final documentos = <Map<String, dynamic>>[];
+
+  while (!proximo.$1.isAfter(fim)) {
+    final leitura = sensor.proxima(horario);
+    acumulado.adicionar(leitura);
+    if (!horario.isBefore(proximo.$1)) {
+      documentos.add(
+        documentoRegistro(
+          horario,
+          proximo.$2,
+          leitura,
+          acumulado,
+          'retroativo',
+        ),
+      );
+      acumulado.zerar();
+      proximo = proximoRegistro(horario);
+    }
+    horario = horario.add(const Duration(seconds: 15));
+  }
+
+  await gravarDocumentos(documentos);
+  print('${documentos.length} registros retroativos gravados.');
+}
+
 // Valor depois de uma opção da linha de comando (ex.: --seed 3).
 String? valorDe(List<String> args, String opcao) {
   final int i = args.indexOf(opcao);
@@ -320,19 +453,28 @@ Future<void> main(List<String> args) async {
     return;
   }
 
+  // Preenche a aba Registros desde 03/08/2026 (uma vez só).
+  if (args.contains('--registros-retroativos')) {
+    await gerarRegistrosRetroativos();
+    return;
+  }
+
   final http.Client? clientePush = await criarClientePush();
   final sensor = SensorSimulado();
+  final acumulado = Acumulador();
+  (DateTime, String) proximo = proximoRegistro(DateTime.now());
 
   // Alerta ativo: push só ao sair da faixa, encerrado com folga abaixo do limite.
   bool alertaTemperatura = false;
   bool alertaUmidade = false;
 
-  // Desvio manual pelo teclado: p, f ou s + Enter.
+  // Desvio manual pelo teclado: p, f, s ou u + Enter.
   stdin.transform(utf8.decoder).transform(const LineSplitter()).listen((linha) {
     sensor.desvioPedido = switch (linha.trim().toLowerCase()) {
       'p' => TipoDesvio.portaAberta,
       'f' => TipoDesvio.falhaRefrigeracao,
       's' => TipoDesvio.picoSensor,
+      'u' => TipoDesvio.umidadeAlta,
       _ => null,
     };
   });
@@ -340,11 +482,33 @@ Future<void> main(List<String> args) async {
   print('Simulador ESP32 iniciado. Ctrl+C para parar.');
   print(
     'Provocar desvio: p = porta aberta, f = falha na refrigeração, '
-    's = pico do sensor (digite e aperte Enter).',
+    's = pico do sensor, u = umidade alta (digite e aperte Enter).',
   );
 
   while (true) {
     final leitura = sensor.proxima(DateTime.now());
+
+    // Registro da manhã ou da tarde, com mínima e máxima desde o anterior.
+    acumulado.adicionar(leitura);
+    final DateTime horarioLocal = DateTime.now();
+    if (!horarioLocal.isBefore(proximo.$1)) {
+      try {
+        await gravarDocumentos([
+          documentoRegistro(
+            horarioLocal,
+            proximo.$2,
+            leitura,
+            acumulado,
+            'simulador',
+          ),
+        ]);
+        print('  -> Registro da ${proximo.$2} gravado.');
+        acumulado.zerar();
+        proximo = proximoRegistro(horarioLocal);
+      } catch (erro) {
+        print('  -> Falha ao gravar o registro, tentando de novo: $erro');
+      }
+    }
 
     final agora = DateTime.now().toUtc().toIso8601String();
     final campos = {
@@ -377,31 +541,42 @@ Future<void> main(List<String> args) async {
           '${leitura.emDesvio ? '  [desvio: ${leitura.tipo}]' : ''}',
         );
 
-        if (leitura.temperatura > temperaturaMax && !alertaTemperatura) {
+        final bool temperaturaFora = leitura.temperatura > temperaturaMax;
+        final bool umidadeFora = leitura.umidade > umidadeMax;
+        final bool novoAlerta =
+            (temperaturaFora && !alertaTemperatura) ||
+            (umidadeFora && !alertaUmidade);
+
+        if (temperaturaFora) {
           alertaTemperatura = true;
-          if (clientePush != null) {
-            await enviarPush(
-              clientePush,
-              'Atenção: temperatura fora da faixa segura',
-              'Sala de amostras: ${leitura.temperatura.toStringAsFixed(1)} °C '
-                  '(limite ${temperaturaMax.toStringAsFixed(0)} °C)',
-            );
-          }
         } else if (leitura.temperatura <= temperaturaMax - folgaTemperatura) {
           alertaTemperatura = false;
         }
-        if (leitura.umidade > umidadeMax && !alertaUmidade) {
+        if (umidadeFora) {
           alertaUmidade = true;
-          if (clientePush != null) {
-            await enviarPush(
-              clientePush,
-              'Atenção: umidade fora da faixa segura',
-              'Sala de amostras: ${leitura.umidade.toStringAsFixed(1)} % '
-                  '(limite ${umidadeMax.toStringAsFixed(0)} %)',
-            );
-          }
         } else if (leitura.umidade <= umidadeMax - folgaUmidade) {
           alertaUmidade = false;
+        }
+
+        // Uma notificação por saída da faixa, citando tudo o que está fora.
+        if (novoAlerta && clientePush != null) {
+          final medidas = [
+            if (temperaturaFora) 'temperatura',
+            if (umidadeFora) 'umidade',
+          ];
+          final valores = [
+            if (temperaturaFora)
+              '${leitura.temperatura.toStringAsFixed(1)} °C '
+                  '(limite ${temperaturaMax.toStringAsFixed(0)} °C)',
+            if (umidadeFora)
+              '${leitura.umidade.toStringAsFixed(1)} % '
+                  '(limite ${umidadeMax.toStringAsFixed(0)} %)',
+          ];
+          await enviarPush(
+            clientePush,
+            'Atenção: ${medidas.join(' e ')} fora da faixa segura',
+            'Sala de amostras: ${valores.join(' · ')}',
+          );
         }
       } else {
         print(
