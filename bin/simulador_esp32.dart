@@ -2,18 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:googleapis_auth/auth_io.dart';
 import 'package:http/http.dart' as http;
 
-// Simula ESP32 enviando leituras de temperatura/umidade pro Firestore, REST API
-const String projectId = 'estufa-app-pi-6';
-const String basePath =
-    'https://firestore.googleapis.com/v1/projects/$projectId'
-    '/databases/(default)/documents/estufa/leitura_atual';
+import 'comum.dart';
 
-// leitura mais recente  (cards)
-final Uri leituraAtualUrl = Uri.parse(basePath);
-
+// Simula o ESP32 enviando leituras de temperatura/umidade ao Firestore (REST API).
 final Uri historicoUrl = Uri.parse('$basePath/historico');
 
 // Registros no formato da ficha FOR 6.3.3 (um documento por manhã/tarde).
@@ -33,61 +26,6 @@ const List<(int, int, String)> horariosRegistro = [
 
 Random random = Random();
 
-// Mesmos limites do app (lib/main.dart).
-const double temperaturaMax = 20.0;
-const double umidadeMax = 60.0;
-
-// Chave da conta de serviço (push), mantida fora do repositório.
-const String caminhoChave = '../chave-firebase.json';
-final Uri envioPushUrl = Uri.parse(
-  'https://fcm.googleapis.com/v1/projects/$projectId/messages:send',
-);
-
-// Cliente autenticado para o FCM; null sem a chave.
-Future<http.Client?> criarClientePush() async {
-  final arquivo = File(caminhoChave);
-  if (!arquivo.existsSync()) {
-    print(
-      'Aviso: $caminhoChave não encontrado. Notificações push desativadas.',
-    );
-    return null;
-  }
-  final credenciais = ServiceAccountCredentials.fromJson(
-    jsonDecode(arquivo.readAsStringSync()),
-  );
-  return clientViaServiceAccount(credenciais, [
-    'https://www.googleapis.com/auth/firebase.messaging',
-  ]);
-}
-
-// Envia notificação ao tópico "alertas".
-Future<void> enviarPush(
-  http.Client cliente,
-  String titulo,
-  String texto,
-) async {
-  try {
-    final resposta = await cliente.post(
-      envioPushUrl,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'message': {
-          'topic': 'alertas',
-          'notification': {'title': titulo, 'body': texto},
-          'android': {'priority': 'high'},
-        },
-      }),
-    );
-    print(
-      resposta.statusCode == 200
-          ? '  -> Notificação enviada: $texto'
-          : '  -> Falha ao enviar notificação (${resposta.statusCode}): ${resposta.body}',
-    );
-  } catch (erro) {
-    print('  -> Falha ao enviar notificação: $erro');
-  }
-}
-
 // Comportamento normal calibrado com a ficha FOR 6.3.3 (agosto/2026) por
 // ml/calibrar_simulador.py: a sala esfria até o meio da manhã, esquenta até o
 // fim da tarde e a umidade faz o caminho inverso.
@@ -106,10 +44,6 @@ const double ruidoUmidade = 0.382;
 // Probabilidade de desvio por leitura (~1 por hora). Não vem da ficha:
 // escolhida para haver eventos suficientes na avaliação do modelo.
 const double chanceDesvio = 0.004;
-
-// Folga para encerrar um alerta (evita push repetido com o valor oscilando no limite).
-const double folgaTemperatura = 0.5;
-const double folgaUmidade = 2.0;
 
 // Desvios simulados; leituras afetadas são marcadas (desvioSimulado),
 // servindo de gabarito para avaliar o modelo de ML.
@@ -464,9 +398,7 @@ Future<void> main(List<String> args) async {
   final acumulado = Acumulador();
   (DateTime, String) proximo = proximoRegistro(DateTime.now());
 
-  // Alerta ativo: push só ao sair da faixa, encerrado com folga abaixo do limite.
-  bool alertaTemperatura = false;
-  bool alertaUmidade = false;
+  final monitor = MonitorAlertas();
 
   // Desvio manual pelo teclado: p, f, s ou u + Enter.
   stdin.transform(utf8.decoder).transform(const LineSplitter()).listen((linha) {
@@ -541,42 +473,9 @@ Future<void> main(List<String> args) async {
           '${leitura.emDesvio ? '  [desvio: ${leitura.tipo}]' : ''}',
         );
 
-        final bool temperaturaFora = leitura.temperatura > temperaturaMax;
-        final bool umidadeFora = leitura.umidade > umidadeMax;
-        final bool novoAlerta =
-            (temperaturaFora && !alertaTemperatura) ||
-            (umidadeFora && !alertaUmidade);
-
-        if (temperaturaFora) {
-          alertaTemperatura = true;
-        } else if (leitura.temperatura <= temperaturaMax - folgaTemperatura) {
-          alertaTemperatura = false;
-        }
-        if (umidadeFora) {
-          alertaUmidade = true;
-        } else if (leitura.umidade <= umidadeMax - folgaUmidade) {
-          alertaUmidade = false;
-        }
-
-        // Uma notificação por saída da faixa, citando tudo o que está fora.
-        if (novoAlerta && clientePush != null) {
-          final medidas = [
-            if (temperaturaFora) 'temperatura',
-            if (umidadeFora) 'umidade',
-          ];
-          final valores = [
-            if (temperaturaFora)
-              '${leitura.temperatura.toStringAsFixed(1)} °C '
-                  '(limite ${temperaturaMax.toStringAsFixed(0)} °C)',
-            if (umidadeFora)
-              '${leitura.umidade.toStringAsFixed(1)} % '
-                  '(limite ${umidadeMax.toStringAsFixed(0)} %)',
-          ];
-          await enviarPush(
-            clientePush,
-            'Atenção: ${medidas.join(' e ')} fora da faixa segura',
-            'Sala de amostras: ${valores.join(' · ')}',
-          );
+        final alerta = monitor.avaliar(leitura.temperatura, leitura.umidade);
+        if (alerta != null && clientePush != null) {
+          await enviarPush(clientePush, alerta.$1, alerta.$2);
         }
       } else {
         print(

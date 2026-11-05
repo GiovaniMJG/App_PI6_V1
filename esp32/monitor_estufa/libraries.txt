@@ -1,0 +1,2 @@
+# Bibliotecas instaladas pelo Wokwi (na Arduino IDE: Gerenciador de Bibliotecas)
+DHT sensor library for ESPx
