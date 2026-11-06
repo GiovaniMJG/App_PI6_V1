@@ -101,6 +101,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Monitor Estufa',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
       ),
@@ -362,7 +363,7 @@ class _PainelHistoricoState extends State<_PainelHistorico> {
                 padding: EdgeInsets.all(32),
                 child: Text(
                   'Nenhuma leitura neste período.\n'
-                  'Ligue o simulador para gerar dados.',
+                  'Aguardando leituras do sensor.',
                   textAlign: TextAlign.center,
                 ),
               );
